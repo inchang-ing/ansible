@@ -325,6 +325,22 @@ echo "rc was $WRONG_RC (2 is expected)"
 
 ansible-vault view "$@" --vault-password-file "${NEW_VAULT_PASSWORD}" "${TEST_FILE}"
 
+# rekey must atomically replace the target (#87679): write_data writes to a
+# temporary file and renames it over the destination, so an interrupted run
+# never leaves the destination with neither the old nor the new contents, and
+# no temporary file is left behind.
+ATOMIC_FILE="${MYTMPDIR}/atomic_test_file"
+echo "original content" > "${ATOMIC_FILE}"
+ansible-vault encrypt "$@" --vault-password-file vault-password "${ATOMIC_FILE}"
+ansible-vault rekey "$@" --vault-password-file vault-password --new-vault-password-file "${NEW_VAULT_PASSWORD}" "${ATOMIC_FILE}"
+# no leftover temporary file from write_data
+leftover=$(ls -1 "${MYTMPDIR}" | grep -E '^atomic_test_file' | grep -v '^atomic_test_file$' || true)
+[ -z "${leftover}" ] || { echo "leftover temporary files from write_data: ${leftover}"; exit 1; }
+ansible-vault view "$@" --vault-password-file "${NEW_VAULT_PASSWORD}" "${ATOMIC_FILE}" >/dev/null
+# rekey back, exercising the atomic replace once more
+ansible-vault rekey "$@" --vault-password-file "${NEW_VAULT_PASSWORD}" --new-vault-password-file vault-password "${ATOMIC_FILE}"
+ansible-vault view "$@" --vault-password-file vault-password "${ATOMIC_FILE}" >/dev/null
+
 # view file with unicode in filename
 ansible-vault view "$@" --vault-password-file vault-password vault-café.yml
 

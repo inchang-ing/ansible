@@ -21,7 +21,6 @@ import errno
 import fcntl
 import functools
 import os
-import random
 import shlex
 import shutil
 import subprocess
@@ -60,7 +59,7 @@ try:
 except ImportError:
     pass
 
-from ansible.errors import AnsibleError, AnsibleAssertionError
+from ansible.errors import AnsibleError
 from ansible import constants as C
 from ansible.module_utils.common.text.converters import to_bytes, to_text, to_native
 from ansible.utils.display import Display
@@ -749,54 +748,10 @@ class VaultEditor:
         self.vault = vault or VaultLib()
 
     # TODO: mv shred file stuff to it's own class
-    def _shred_file_custom(self, tmp_path):
-        """"Destroy a file, when shred (core-utils) is not available
-
-        Unix `shred' destroys files "so that they can be recovered only with great difficulty with
-        specialised hardware, if at all". It is based on the method from the paper
-        "Secure Deletion of Data from Magnetic and Solid-State Memory",
-        Proceedings of the Sixth USENIX Security Symposium (San Jose, California, July 22-25, 1996).
-
-        We do not go to that length to re-implement shred in Python; instead, overwriting with a block
-        of random data should suffice.
-
-        See https://github.com/ansible/ansible/pull/13700 .
-        """
-
-        file_len = os.path.getsize(tmp_path)
-
-        if file_len > 0:  # avoid work when file was empty
-            max_chunk_len = min(1024 * 1024 * 2, file_len)
-
-            passes = 3
-            with open(tmp_path, "wb") as fh:
-                for dummy in range(passes):
-                    fh.seek(0, 0)
-                    # get a random chunk of data, each pass with other length
-                    chunk_len = random.randint(max_chunk_len // 2, max_chunk_len)
-                    data = os.urandom(chunk_len)
-
-                    for dummy in range(0, file_len // chunk_len):
-                        fh.write(data)
-                    fh.write(data[:file_len % chunk_len])
-
-                    # FIXME remove this assert once we have unittests to check its accuracy
-                    if fh.tell() != file_len:
-                        raise AnsibleAssertionError()
-
-                    os.fsync(fh)
-
     def _shred_file(self, tmp_path):
-        """Securely destroy a decrypted file
+        """Securely destroy a file using the `shred` utility.
 
-        Note standard limitations of GNU shred apply (For flash, overwriting would have no effect
-        due to wear leveling; for other storage systems, the async kernel->filesystem->disk calls never
-        guarantee data hits the disk; etc). Furthermore, if your tmp dirs is on tmpfs (ramdisks),
-        it is a non-issue.
-
-        Nevertheless, some form of overwriting the data (instead of just removing the fs index entry) is
-        a good idea. If shred is not available (e.g. on windows, or no core-utils installed), fall back on
-        a custom shredding method.
+        Falls back to a plain removal when `shred` is unavailable.
         """
 
         if not os.path.isfile(tmp_path):
@@ -804,20 +759,16 @@ class VaultEditor:
             return
 
         try:
-            r = subprocess.call(['shred', tmp_path])
+            subprocess.call(['shred', tmp_path])
         except (OSError, ValueError):
-            # shred is not available on this system, or some other error occurred.
-            # ValueError caught because macOS El Capitan is raising an
-            # exception big enough to hit a limit in python2-2.7.11 and below.
-            # Symptom is ValueError: insecure pickle when shred is not
-            # installed there.
-            r = 1
-
-        if r != 0:
-            # we could not successfully execute unix shred; therefore, do custom shred.
-            self._shred_file_custom(tmp_path)
-
-        os.remove(tmp_path)
+            # shred is not available on this system (for example, when coreutils
+            # is not installed). A plain removal is the only fallback.
+            pass
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
     def _edit_file_helper(self, filename, secret, existing_data=None, force_save=False, vault_id=None):
 
@@ -1081,15 +1032,12 @@ class VaultEditor:
 
                 self._copy_dest_attributes(thefile, tmp_path, mode)
 
-                # The new data is on disk, so the old contents can go now.
-                # Once they do, the temporary file is the only copy left, so a
-                # failed replace must keep it.
-                shred_error = None
-                if shred:
-                    try:
-                        self._shred_file(thefile)
-                    except (OSError, AnsibleAssertionError) as e:
-                        shred_error = e
+                # Securely erase the previous contents before replacing them.
+                # The temp file is now the only good copy, so a failed replace
+                # must preserve it rather than leave the destination empty.
+                shred_ran = False
+                if shred and os.path.exists(thefile):
+                    self._shred_file(thefile)
                     shred_ran = True
 
                 try:
@@ -1100,9 +1048,6 @@ class VaultEditor:
                                            % (to_native(e), to_native(tmp_path)))
                     raise AnsibleError('Unable to replace vault file: %s' % to_native(e))
                 tmp_path = None
-
-                if shred_error is not None:
-                    raise AnsibleError('Unable to shred the previous contents of %s: %s' % (to_native(thefile), to_native(shred_error)))
             finally:
                 if tmp_path is not None and not shred_ran:
                     try:
@@ -1127,8 +1072,10 @@ class VaultEditor:
             return
 
         dest_stat = os.stat(dest)
+        tmp_stat = os.stat(tmp_path)
         try:
-            os.chown(tmp_path, dest_stat.st_uid, dest_stat.st_gid)
+            if dest_stat.st_uid != tmp_stat.st_uid or dest_stat.st_gid != tmp_stat.st_gid:
+                os.chown(tmp_path, dest_stat.st_uid, dest_stat.st_gid)
             shutil.copystat(dest, tmp_path)
             os.utime(tmp_path, times=(time.time(), time.time()))
         except OSError as e:
